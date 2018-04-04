@@ -9,120 +9,12 @@ from copy import deepcopy
 import json
 from numpy.linalg import norm
 from numpy import dot
-import numpy as np
 import codecs
 from scipy.stats import spearmanr
 import tensorflow as tf
-import torch
-import torch.nn as nn
-from torch.autograd import Variable
 
 from scipy.spatial.distance import pdist
 from scipy.spatial.distance import squareform
-if torch.cuda.is_available:
-    CUDA = 0
-
-def FloatTensorWrapper(tensor, cuda=0):
-    if cuda >= 0:
-        tensor = torch.FloatTensor(tensor).cuda(cuda)
-    else:
-        tensor = torch.FloatTensor(tensor)
-    return tensor
-
-def LongTensorWrapper(tensor, cuda=0):
-    if cuda >= 0:
-        tensor = torch.LongTensor(tensor).cuda(cuda)
-    else:
-        tensor = torch.LongTensor(tensor)
-    return tensor
-
-def DoubleTensorWrapper(tensor, cuda=0):
-    if cuda >= 0:
-        tensor = torch.DoubleTensor(tensor).cuda(cuda)
-    else:
-        tensor = torch.DoubleTensor(tensor)
-    return tensor
-
-def l2_loss(input_tensor, target_tensor):
-    loss_matrix = nn.functional.mse_loss(input_tensor, target_tensor, reduce=False)
-    return torch.sum(loss_matrix)/2
-
-class PytorchModel(torch.nn.Module):
-    def __init__(self, W, attract_margin_value=1.0, repel_margin_value=0.0, l2_reg_constant=1e-9):
-        super(PytorchModel, self).__init__()
-        self.attract_margin = attract_margin_value
-        self.repel_margin = repel_margin_value
-        self.regularisation_constant = l2_reg_constant
-        
-        self.init_W = nn.Embedding(W.shape[0], W.shape[1])
-        self.init_W.weight = nn.Parameter(torch.DoubleTensor(W), requires_grad=False)
-        self.dynamic_W = nn.Embedding(W.shape[0], W.shape[1])
-        self.dynamic_W.weight = nn.Parameter(torch.DoubleTensor(W), requires_grad=True)
-    
-    def attract_cost(self, attract_examples, negative_examples_attract):
-        np_attract_examples = np.array(attract_examples)
-        np_negative_examples_attract = np.array(negative_examples_attract)
-
-        attract_examples_left = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_attract_examples[:,0], CUDA))))
-        attract_examples_right = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_attract_examples[:,1], CUDA))))
-        
-        negative_examples_attract_left = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_negative_examples_attract[:,0], CUDA))))
-        negative_examples_attract_right = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_negative_examples_attract[:,1], CUDA))))
-        
-        # dot product between the example pairs.
-        attract_similarity_between_examples = torch.sum(torch.mul(attract_examples_left, attract_examples_right), 1)
-        
-        # dot product of each word in the example with its negative example. 
-        attract_similarity_to_negatives_left = torch.sum(torch.mul(attract_examples_left, negative_examples_attract_left), 1) 
-        attract_similarity_to_negatives_right = torch.sum(torch.mul(attract_examples_right, negative_examples_attract_right), 1)
-
-        attract_cost = nn.functional.relu(self.attract_margin + attract_similarity_to_negatives_left - attract_similarity_between_examples) + \
-                       nn.functional.relu(self.attract_margin + attract_similarity_to_negatives_right - attract_similarity_between_examples)
-        
-        original_attract_examples_left = self.init_W(LongTensorWrapper(np_attract_examples[:,0], CUDA))
-        original_attract_examples_right = self.init_W(LongTensorWrapper(np_attract_examples[:,1], CUDA))
-
-        original_negative_examples_attract_left = self.init_W(LongTensorWrapper(np_negative_examples_attract[:,0], CUDA))
-        original_negative_examples_attract_right = self.init_W(LongTensorWrapper(np_negative_examples_attract[:,1], CUDA))
-
-        # and then define the respective regularisation costs:
-        regularisation_cost_attract = self.regularisation_constant * (l2_loss(original_attract_examples_left, attract_examples_left) + l2_loss(original_attract_examples_right, attract_examples_right))
-        
-        attract_cost += regularisation_cost_attract
-
-        return attract_cost
-
-    def repel_cost(self, repel_examples, negative_examples_repel):
-        np_repel_examples = np.array(repel_examples)
-        np_negative_examples_repel = np.array(negative_examples_repel)
-
-        repel_examples_left = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_repel_examples[:,0], CUDA))))
-        repel_examples_right = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_repel_examples[:,1], CUDA))))
-
-        negative_examples_repel_left = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_negative_examples_repel[:,0], CUDA))))
-        negative_examples_repel_right = nn.functional.normalize(self.dynamic_W(Variable(LongTensorWrapper(np_negative_examples_repel[:,1], CUDA))))
-        
-        # dot product between the example pairs.
-        repel_similarity_between_examples = torch.sum(torch.mul(repel_examples_left, repel_examples_right), 1)
-        
-        # dot product of each word in the example with its negative example. 
-        repel_similarity_to_negatives_left = torch.sum(torch.mul(repel_examples_left, negative_examples_repel_left), 1) 
-        repel_similarity_to_negatives_right = torch.sum(torch.mul(repel_examples_right, negative_examples_repel_right), 1)
-
-        repel_cost = nn.functional.relu(self.repel_margin + repel_similarity_to_negatives_left - repel_similarity_between_examples) + \
-                       nn.functional.relu(self.repel_margin + repel_similarity_to_negatives_right - repel_similarity_between_examples)
-        
-        # load the original distributional vectors for the example pairs: 
-        original_repel_examples_left = self.init_W(LongTensorWrapper(np_repel_examples[:,0], CUDA))
-        original_repel_examples_right = self.init_W(LongTensorWrapper(np_repel_examples[:,1], CUDA))
-
-        original_negative_examples_repel_left = self.init_W(LongTensorWrapper(np_negative_examples_repel[:,0], CUDA))
-        original_negative_examples_repel_right = self.init_W(LongTensorWrapper(np_negative_examples_repel[:,1], CUDA))
-
-        # and then define the respective regularisation costs:
-        regularisation_cost_repel = self.regularisation_constant * (l2_loss(original_repel_examples_left, repel_examples_left) + l2_loss(original_repel_examples_right, repel_examples_right))
-        repel_cost += regularisation_cost_repel
-        return repel_cost
 
 
 class ExperimentRun:
@@ -199,16 +91,123 @@ class ExperimentRun:
         self.vocabulary_size = len(self.vocabulary)
 
         # Next, prepare the matrix of initial vectors and initialise the model. 
-        numpy_embedding = numpy.zeros((self.vocabulary_size, self.embedding_size), dtype="float64")
+
+        numpy_embedding = numpy.zeros((self.vocabulary_size, self.embedding_size), dtype="float32")
         for idx in range(0, self.vocabulary_size):
             numpy_embedding[idx, :] = distributional_vectors[self.inverted_index[idx]]
 
-        self.model = PytorchModel(numpy_embedding, 
-                                  attract_margin_value=self.attract_margin_value, 
-                                  repel_margin_value=self.repel_margin_value,
-                                  l2_reg_constant=self.regularisation_constant_value)
-        if CUDA >= 0:
-            self.model.cuda(CUDA)
+        # load the handles so that we can load current state of vectors from the Tensorflow embedding. 
+        embedding_handles = self.initialise_model(numpy_embedding)
+        
+        self.embedding_attract_left = embedding_handles[0]
+        self.embedding_attract_right = embedding_handles[1]
+        self.embedding_repel_left = embedding_handles[2]
+        self.embedding_repel_right = embedding_handles[3]
+
+        init = tf.global_variables_initializer()
+        
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        self.sess = tf.Session(config=config)
+        self.sess.run(init)
+
+
+    def initialise_model(self, numpy_embedding):
+        """
+        Initialises the TensorFlow Attract-Repel model.
+        """
+        self.attract_examples = tf.placeholder(tf.int32, [None, 2]) # each element is the position of word vector. 
+        self.repel_examples = tf.placeholder(tf.int32, [None, 2]) # each element is again the position of word vector.
+
+        self.negative_examples_attract = tf.placeholder(tf.int32, [None, 2])
+        self.negative_examples_repel = tf.placeholder(tf.int32, [None, 2])
+
+        self.attract_margin = tf.placeholder("float")
+        self.repel_margin = tf.placeholder("float")
+        self.regularisation_constant = tf.placeholder("float")
+        
+        # Initial (distributional) vectors. Needed for L2 regularisation.         
+        self.W_init = tf.constant(numpy_embedding, name="W_init")
+
+        # Variable storing the updated word vectors. 
+        self.W_dynamic = tf.Variable(numpy_embedding, name="W_dynamic")
+
+
+        # Attract Cost Function: 
+
+        # placeholders for example pairs...
+        attract_examples_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.attract_examples[:, 0]), 1) 
+        attract_examples_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.attract_examples[:, 1]), 1)
+
+        # and their respective negative examples:
+        negative_examples_attract_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_attract[:, 0]), 1)
+        negative_examples_attract_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_attract[:, 1]), 1)
+
+        # dot product between the example pairs. 
+        attract_similarity_between_examples = tf.reduce_sum(tf.multiply(attract_examples_left, attract_examples_right), 1) 
+
+        # dot product of each word in the example with its negative example. 
+        attract_similarity_to_negatives_left = tf.reduce_sum(tf.multiply(attract_examples_left, negative_examples_attract_left), 1) 
+        attract_similarity_to_negatives_right = tf.reduce_sum(tf.multiply(attract_examples_right, negative_examples_attract_right), 1)
+
+        # and the final Attract Cost Function (sans regularisation):
+        self.attract_cost = tf.nn.relu(self.attract_margin + attract_similarity_to_negatives_left - attract_similarity_between_examples) + \
+                       tf.nn.relu(self.attract_margin + attract_similarity_to_negatives_right - attract_similarity_between_examples)
+
+        # Repel Cost Function: 
+
+        # placeholders for example pairs...
+        repel_examples_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.repel_examples[:, 0]), 1) # becomes batch_size X vector_dimension 
+        repel_examples_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.repel_examples[:, 1]), 1)
+
+        # and their respective negative examples:
+        negative_examples_repel_left  = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_repel[:, 0]), 1)
+        negative_examples_repel_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_repel[:, 1]), 1)
+
+        # dot product between the example pairs. 
+        repel_similarity_between_examples = tf.reduce_sum(tf.multiply(repel_examples_left, repel_examples_right), 1) # becomes batch_size again, might need tf.squeeze
+
+        # dot product of each word in the example with its negative example. 
+        repel_similarity_to_negatives_left = tf.reduce_sum(tf.multiply(repel_examples_left, negative_examples_repel_left), 1)
+        repel_similarity_to_negatives_right = tf.reduce_sum(tf.multiply(repel_examples_right, negative_examples_repel_right), 1)
+
+        # and the final Repel Cost Function (sans regularisation):
+        self.repel_cost = tf.nn.relu(self.repel_margin - repel_similarity_to_negatives_left + repel_similarity_between_examples) + \
+                       tf.nn.relu(self.repel_margin - repel_similarity_to_negatives_right + repel_similarity_between_examples)
+
+
+        # The Regularisation Cost (separate for the two terms, depending on which one is called): 
+
+        # load the original distributional vectors for the example pairs: 
+        original_attract_examples_left = tf.nn.embedding_lookup(self.W_init, self.attract_examples[:, 0])
+        original_attract_examples_right = tf.nn.embedding_lookup(self.W_init, self.attract_examples[:, 1])
+
+        original_repel_examples_left = tf.nn.embedding_lookup(self.W_init, self.repel_examples[:, 0])
+        original_repel_examples_right = tf.nn.embedding_lookup(self.W_init, self.repel_examples[:, 1])
+
+        # and then define the respective regularisation costs:
+        regularisation_cost_attract = self.regularisation_constant * (tf.nn.l2_loss(original_attract_examples_left - attract_examples_left) + tf.nn.l2_loss(original_attract_examples_right - attract_examples_right))
+        self.attract_cost += regularisation_cost_attract
+
+        regularisation_cost_repel = self.regularisation_constant * (tf.nn.l2_loss(original_repel_examples_left - repel_examples_left) + tf.nn.l2_loss(original_repel_examples_right - repel_examples_right))
+        self.repel_cost += regularisation_cost_repel
+    
+        # Finally, we define the training step functions for both steps. 
+
+        tvars = tf.trainable_variables()
+        attract_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.attract_cost, tvars)]
+        self.attract_grads = attract_grads
+        repel_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.repel_cost, tvars)]
+
+        attract_optimiser = tf.train.AdagradOptimizer(0.05) 
+        repel_optimiser = tf.train.AdagradOptimizer(0.05) 
+        
+        self.attract_cost_step = attract_optimiser.apply_gradients(zip(attract_grads, tvars))
+        self.repel_cost_step = repel_optimiser.apply_gradients(zip(repel_grads, tvars))
+
+        # return the handles for loading vectors from the TensorFlow embeddings:
+        return attract_examples_left, attract_examples_right, repel_examples_left, repel_examples_right
+
 
     def load_constraints(self, constraints_filepath):
         """
@@ -260,13 +259,10 @@ class ExperimentRun:
         in each words example pair. 
         """
 
-        np_list_minibatch = np.array(list_minibatch)
-
         list_of_representations = []
         list_of_indices = []
-        lefts = Variable(LongTensorWrapper(np_list_minibatch[:, 0], CUDA))
-        rights = Variable(LongTensorWrapper(np_list_minibatch[:, 1], CUDA))
-        representations = [nn.functional.normalize(self.model.dynamic_W(lefts)).data.cpu().numpy(), nn.functional.normalize(self.model.dynamic_W(rights)).data.cpu().numpy()]
+
+        representations = self.sess.run([self.embedding_attract_left, self.embedding_attract_right], feed_dict={self.attract_examples: list_minibatch})
 
         for idx, (example_left, example_right) in enumerate(list_minibatch):
 
@@ -276,7 +272,7 @@ class ExperimentRun:
             list_of_indices.append(example_left)
             list_of_indices.append(example_right)
 
-        condensed_distance_list = pdist(list_of_representations, 'cosine')
+        condensed_distance_list = pdist(list_of_representations, 'cosine') 
         square_distance_list = squareform(condensed_distance_list)   
 
         if attract_batch: 
@@ -348,10 +344,7 @@ class ExperimentRun:
 
             fwrite_simlex = open("results/simlex_scores.txt", "w")
             fwrite_wordsim = open("results/wordsim_scores.txt", "w")
-        
-        # set optimizer 
-        attract_optimizer = torch.optim.Adagrad(self.model.dynamic_W.parameters(), lr=0.01)
-        repel_optimizer = torch.optim.Adagrad(self.model.dynamic_W.parameters(), lr=0.01)
+
         while current_iteration < self.max_iter:
 
             # how many attract/repel batches we've done in this epoch so far.
@@ -392,31 +385,28 @@ class ExperimentRun:
 
                 if syn_or_ant_batch == 0:
                     # do one synonymy batch:
+
                     synonymy_examples = [self.synonyms[order_of_synonyms[x]] for x in range(synonym_counter * self.batch_size, (synonym_counter+1) * self.batch_size)]
                     current_negatives = self.extract_negative_examples(synonymy_examples, attract_batch=True)
 
-                    attract_cost = self.model.attract_cost(synonymy_examples, current_negatives)
-                    # apply gradients
-                    self.model.zero_grad()
-                    torch.sum(attract_cost).backward()
-                    self.model.dynamic_W.weight.grad.data.clamp_(-2.0, 2.0)
-                    attract_optimizer.step()
-                    
+                    attract_grads, _ = self.sess.run([self.attract_grads, self.attract_cost_step], feed_dict={self.attract_examples: synonymy_examples, self.negative_examples_attract: current_negatives, \
+                                                                  self.attract_margin: self.attract_margin_value, self.regularisation_constant: self.regularisation_constant_value})
+                    W_dynamic, W_init = self.sess.run([self.W_dynamic, self.W_init])
+                    print("change of W")
+                    print(numpy.sum(numpy.abs(W_dynamic - W_init)))
+                    input()
                     synonym_counter += 1
 
                 else:
 
                     antonymy_examples = [self.antonyms[order_of_antonyms[x]] for x in range(antonym_counter * self.batch_size, (antonym_counter+1) * self.batch_size)]
                     current_negatives = self.extract_negative_examples(antonymy_examples, attract_batch=False)
-                    repel_cost = self.model.repel_cost(antonymy_examples, current_negatives)
-                    # apply gradients
-                    self.model.zero_grad()
-                    torch.sum(repel_cost).backward()
-                    self.model.dynamic_W.weight.grad.data.clamp_(-2.0, 2.0)
-                    repel_optimizer.step()
+
+                    self.sess.run([self.repel_cost_step], feed_dict={self.repel_examples: antonymy_examples, self.negative_examples_repel: current_negatives, \
+                                                                  self.repel_margin: self.repel_margin_value, self.regularisation_constant: self.regularisation_constant_value})
 
                     antonym_counter += 1
-                     
+
             current_iteration += 1
             self.create_vector_dictionary() # whether to print SimLex score at the end of each epoch
 
@@ -427,7 +417,7 @@ class ExperimentRun:
         """
         log_time = time.time()
 
-        current_vectors = self.model.dynamic_W.weight.data.cpu().numpy()
+        [current_vectors] = self.sess.run([self.W_dynamic])
         self.word_vectors = {}
         for idx in range(0, self.vocabulary_size):
             self.word_vectors[self.inverted_index[idx]] = normalise_vector(current_vectors[idx, :])
@@ -492,7 +482,7 @@ def load_word_vectors(fname, isBinary=False):
         with open(fname, "rb") as f:
             header = f.readline()
             vocab_size, layer1_size = map(int, header.split())
-            binary_len = numpy.dtype('float64').itemsize * layer1_size
+            binary_len = numpy.dtype('float32').itemsize * layer1_size
             for line in range(vocab_size):
                 word = b""
                 while True:
@@ -501,14 +491,14 @@ def load_word_vectors(fname, isBinary=False):
                         break
                     if ch != b'\n':
                         word += ch  
-                word_vecs[word.decode()] = numpy.fromstring(f.read(binary_len), dtype='float64')  
+                word_vecs[word.decode()] = numpy.fromstring(f.read(binary_len), dtype='float32')  
     else:
         f = codecs.open(fname, 'r', 'utf-8')
         f.readline()
         for line in f:
             line = line.split(" ", 1)
             key = line[0].lower()
-            word_vecs[key] = numpy.fromstring(line[1], dtype="float64", sep=" ")
+            word_vecs[key] = numpy.fromstring(line[1], dtype="float32", sep=" ")
     
     print(len(word_vecs), "vectors loaded from", fname)
     return word_vecs
